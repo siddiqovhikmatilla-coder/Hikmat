@@ -54,7 +54,7 @@ const MAX = 50 * 1024 * 1024;
 const PAGE = 60;
 
 const S = {
-  contacts:{}, myPhone:null,
+  contacts:{}, myPhone:null, hidden:new Set(),
   me:null, profile:null, profiles:{}, chats:[], unread:{}, active:null, msgs:[], hasMore:false, loadingMsgs:false,
   reply:null, editing:null, q:"", draft:{}, search:null, rec:null, audio:null, online:{}, typing:{}, stickers:[],
   pending:{}, presence:null, lastTyping:0, typingTimer:null, offline:false, savedId:null, started:false
@@ -216,13 +216,20 @@ async function start(user){
     </aside>
     <main class="chat" id="chat"><div class="no-chat"><span>Suhbatni tanlang</span></div></main>
   </div>`;
-  $("#list").addEventListener("click", e => { const it = e.target.closest(".item"); if (it) openChat(it.dataset.id); });
+  $("#list").addEventListener("click", e => { if (S.justPressed && Date.now() - S.justPressed < 700) return; const it = e.target.closest(".item[data-id]"); if (it) openChat(it.dataset.id); });
+  const listMenu = (id, x, y) => { const c = getChat(id); if (!c) return; showMenu([["send", "Ochish", () => openChat(id)], ...(c.type !== "saved" ? [["info", c.type === "group" ? "Guruh ma'lumotlari" : "Profil", () => chatInfo(c)]] : []), ["trash", c.type === "saved" ? "Tozalash" : c.type === "dm" || c.created_by === S.me ? "Chatni o'chirish" : "Guruhdan chiqish", () => deleteChatDlg(c), true]], x, y); };
+  $("#list").addEventListener("contextmenu", e => { const it = e.target.closest(".item[data-id]"); if (!it) return; e.preventDefault(); listMenu(it.dataset.id, e.clientX, e.clientY); });
+  let lpT = null, lpMoved = false;
+  $("#list").addEventListener("touchstart", e => { const it = e.target.closest(".item[data-id]"); if (!it) return; lpMoved = false; const t = e.touches[0]; lpT = setTimeout(() => { if (lpMoved) return; S.justPressed = Date.now(); try { navigator.vibrate && navigator.vibrate(10); } catch(_){} listMenu(it.dataset.id, t.clientX, t.clientY); }, 480); }, {passive:true});
+  $("#list").addEventListener("touchmove", () => { lpMoved = true; clearTimeout(lpT); }, {passive:true});
+  $("#list").addEventListener("touchend", () => clearTimeout(lpT), {passive:true});
   $("#q").addEventListener("input", e => { S.q = e.target.value; renderList(); if (S.q.trim().length >= 2) searchPeople(S.q.trim()); });
   $("#fab").onclick = fabMenu;
   $("#menuBtn").onclick = mainMenu;
   await loadMyProfile();
   try { const { data } = await sb.rpc("get_or_create_saved"); S.savedId = data; } catch(e){}
   await loadContacts();
+  sb.from("hidden_messages").select("msg_id").limit(10000).then(r => { (r.data || []).forEach(x => S.hidden.add(x.msg_id)); renderMsgs(false); }).catch(() => {});
   await loadChats();
   subscribeDb(); startPresence(); listenCalls(); loadStickers(); touchLastSeen();
   sb.from("phones").select("phone").eq("user_id", S.me).maybeSingle().then(r => { if (r && r.data) S.myPhone = r.data.phone; }).catch(() => {});
@@ -249,9 +256,9 @@ async function loadProfiles(ids){
   renderList(); renderHead(); renderMsgs(false);
 }
 async function loadChats(){
-  const { data, error } = await sb.from("members").select("chat_id,last_read,chats(*)").eq("user_id", S.me);
+  const { data, error } = await sb.from("members").select("chat_id,last_read,cleared_at,chats(*)").eq("user_id", S.me);
   if (error) { toast("Chatlarni yuklab bo'lmadi"); return; }
-  const chats = (data || []).filter(r => r.chats).map(r => ({...r.chats, members:[], reads:{}}));
+  const chats = (data || []).filter(r => r.chats).map(r => ({...r.chats, members:[], reads:{}, cleared: r.cleared_at ? ts(r.cleared_at) : 0}));
   const ids = chats.map(c => c.id);
   if (ids.length) {
     const { data: mem } = await sb.from("members").select("chat_id,user_id,last_read").in("chat_id", ids);
@@ -439,6 +446,7 @@ function renderList(){
   const q = S.q.trim().toLowerCase();
   let html = "";
   for (const c of S.chats) {
+    if (c.cleared && ts(c.last_at) <= c.cleared && S.active !== c.id) continue;
     const title = chatTitle(c);
     if (q && !title.toLowerCase().includes(q) && !(c.last_text||"").toLowerCase().includes(q)) continue;
     const who = c.type === "group" && c.last_from && c.last_text ? `<b>${esc(c.last_from === S.me ? "Siz" : nameOf(c.last_from).split(" ")[0])}: </b>` : (c.type === "dm" && c.last_from === S.me && c.last_text ? "<b>Siz: </b>" : "");
@@ -626,8 +634,10 @@ function autosize(ta){ ta.style.height = "auto"; ta.style.height = Math.min(ta.s
 
 /* ---------- messages render ---------- */
 function currentMsgs(){
+  const c = getChat(S.active); const cl = (c && c.cleared) || 0;
+  const base = S.msgs.filter(m => !S.hidden.has(m.id) && (!cl || m.at > cl));
   const pend = (S.pending[S.active] || []).filter(p => !S.msgs.some(m => m.id === p.id));
-  return pend.length ? [...S.msgs, ...pend].sort((a, b) => a.at - b.at) : S.msgs;
+  return pend.length ? [...base, ...pend].sort((a, b) => a.at - b.at) : base;
 }
 function seenBy(m){ const c = getChat(m.chat_id); if (!c) return false; return Object.entries(c.reads || {}).some(([u, at]) => u !== S.me && at >= m.at - 1000); }
 function mediaHtml(m){
@@ -759,7 +769,8 @@ async function openChat(id){
 async function reloadMsgs(){
   const id = S.active; if (!id) return;
   S.loadingMsgs = true; renderMsgs(true);
-  const { data, error } = await sb.from("messages").select("*").eq("chat_id", id).order("created_at", {ascending:false}).limit(PAGE);
+  let mq = sb.from("messages").select("*").eq("chat_id", id); const cc = getChat(id); if (cc && cc.cleared) mq = mq.gt("created_at", new Date(cc.cleared).toISOString());
+  const { data, error } = await mq.order("created_at", {ascending:false}).limit(PAGE);
   if (S.active !== id) return;
   S.loadingMsgs = false;
   if (error) { const w = $("#wrap"); if (w) w.innerHTML = '<div class="empty-chat">Xabarlarni yuklab bo\'lmadi. Internetni tekshiring.</div>'; return; }
@@ -770,7 +781,8 @@ async function reloadMsgs(){
 async function loadOlder(){
   if (S.loadingMsgs || !S.hasMore || !S.msgs.length) return;
   const id = S.active; S.loadingMsgs = true; renderMsgs(false, true);
-  const { data } = await sb.from("messages").select("*").eq("chat_id", id).lt("created_at", S.msgs[0].created_at).order("created_at", {ascending:false}).limit(PAGE);
+  let oq = sb.from("messages").select("*").eq("chat_id", id).lt("created_at", S.msgs[0].created_at); const oc = getChat(id); if (oc && oc.cleared) oq = oq.gt("created_at", new Date(oc.cleared).toISOString());
+  const { data } = await oq.order("created_at", {ascending:false}).limit(PAGE);
   if (S.active !== id) return;
   S.loadingMsgs = false;
   const older = (data || []).reverse().map(norm).filter(m => !S.msgs.some(x => x.id === m.id));
@@ -1174,20 +1186,75 @@ async function saveToDevice(x, m){
 }
 
 /* ---------- message actions ---------- */
-async function delMsg(m){
-  if (!await confirmDlg("Xabarni o'chirish", "Bu xabar hamma uchun o'chiriladi.", "O'chirish")) return;
-  const { error } = await sb.from("messages").delete().eq("id", m.id);
-  if (error) return toast("O'chirib bo'lmadi");
-  S.msgs = S.msgs.filter(x => x.id !== m.id); renderMsgs(false);
-  if (!m.fwd_from && m.kind !== "sticker") {
-    const paths = []; (m.media || []).forEach(x => { [x.url, x.poster].forEach(u => { const p = storagePath(u); if (p && p.startsWith(S.me + "/")) paths.push(p); }); });
-    if (paths.length) sb.storage.from("media").remove(paths).catch(() => {});
-  }
+function canDeleteForAll(m){
+  const c = getChat(m.chat_id); if (!c) return false;
+  return m.from === S.me || c.type === "dm" || c.created_by === S.me;
+}
+function delMsg(m){
   const c = getChat(m.chat_id);
-  if (c && ts(c.last_at) <= m.at + 2000) {
-    const last = S.msgs[S.msgs.length - 1];
-    await sb.from("chats").update(last ? {last_text:preview(last).slice(0, 120), last_at:last.created_at, last_from:last.from} : {last_text:""}).eq("id", c.id);
-  }
+  const all = canDeleteForAll(m) && c && c.type !== "saved";
+  const who = c && c.type === "dm" ? nameOf(dmPeer(c)) : "hamma";
+  dialog(`<h3>Xabarni o'chirish</h3><p>Bu xabarni o'chirmoqchimisiz?</p>
+    ${all ? `<label class="chk"><input type="checkbox" id="dAll" ${m.from === S.me ? "checked" : ""}> <span>${c.type === "dm" ? esc(who) + " uchun ham o'chirish" : "Hamma uchun o'chirish"}</span></label>` : ""}
+    <div class="acts"><button data-a="no">Bekor qilish</button><button class="red" data-a="ok">O'chirish</button></div>`, (v, close) => {
+    v.querySelector('[data-a="no"]').onclick = close;
+    v.querySelector('[data-a="ok"]').onclick = async () => {
+      const forAll = c && c.type === "saved" ? true : !!(v.querySelector("#dAll") && v.querySelector("#dAll").checked);
+      close();
+      if (!forAll) {
+        S.hidden.add(m.id); renderMsgs(false);
+        const { error } = await sb.from("hidden_messages").insert({user_id:S.me, msg_id:m.id});
+        if (error) { S.hidden.delete(m.id); renderMsgs(false); toast("O'chirib bo'lmadi"); }
+        return;
+      }
+      const { error } = await sb.from("messages").delete().eq("id", m.id);
+      if (error) return toast("O'chirib bo'lmadi");
+      S.msgs = S.msgs.filter(x => x.id !== m.id); renderMsgs(false);
+      if (m.from === S.me && !m.fwd_from && m.kind !== "sticker") {
+        const paths = []; (m.media || []).forEach(x => { [x.url, x.poster].forEach(u => { const p = storagePath(u); if (p && p.startsWith(S.me + "/")) paths.push(p); }); });
+        if (paths.length) sb.storage.from("media").remove(paths).catch(() => {});
+      }
+      if (c && ts(c.last_at) <= m.at + 2000) {
+        const last = S.msgs[S.msgs.length - 1];
+        await sb.from("chats").update(last ? {last_text:preview(last).slice(0, 120), last_at:last.created_at, last_from:last.from} : {last_text:""}).eq("id", c.id);
+      }
+    };
+  });
+}
+/* Chatni o'chirish: faqat o'zimdan yoki ikkalamizdan */
+function deleteChatDlg(c){
+  if (!c) return;
+  if (c.type === "saved") return confirmDlg("Saqlangan xabarlarni tozalash", "Barcha saqlangan xabarlar o'chiriladi.", "Tozalash").then(async ok => { if (!ok) return; await sb.from("messages").delete().eq("chat_id", c.id); if (S.active === c.id) reloadMsgs(); c.last_text = ""; renderList(); toast("Tozalandi"); });
+  const dm = c.type === "dm", owner = c.created_by === S.me;
+  if (!dm && !owner) return confirmDlg("Guruhdan chiqish", `«${chatTitle(c)}» guruhidan chiqasizmi? Guruh siz uchun o'chadi.`, "Chiqish").then(async ok => { if (!ok) return; await sb.from("members").delete().eq("chat_id", c.id).eq("user_id", S.me); dropChat(c.id); });
+  dialog(`<h3>${dm ? "Chatni o'chirish" : "Guruhni o'chirish"}</h3><p>${dm ? `${esc(nameOf(dmPeer(c)))} bilan chat o'chirilsinmi?` : `«${esc(chatTitle(c))}» guruhi o'chirilsinmi?`}</p>
+    <label class="chk"><input type="checkbox" id="dAll"> <span>${dm ? esc(nameOf(dmPeer(c))) + " uchun ham o'chirish" : "Hamma a'zolar uchun o'chirish"}</span></label>
+    <div class="acts"><button data-a="no">Bekor qilish</button><button class="red" data-a="ok">O'chirish</button></div>`, (v, close) => {
+    v.querySelector('[data-a="no"]').onclick = close;
+    v.querySelector('[data-a="ok"]').onclick = async () => {
+      const forAll = v.querySelector("#dAll").checked; close();
+      if (forAll) {
+        const { error } = await sb.from("chats").delete().eq("id", c.id);
+        if (error) return toast("O'chirib bo'lmadi");
+        dropChat(c.id); toast("Chat ikkala tomondan o'chirildi");
+      } else if (dm) {
+        const now = new Date();
+        const { error } = await sb.from("members").update({cleared_at:now.toISOString(), last_read:now.toISOString()}).eq("chat_id", c.id).eq("user_id", S.me);
+        if (error) return toast("O'chirib bo'lmadi");
+        c.cleared = now.getTime(); S.unread[c.id] = 0;
+        if (S.active === c.id) { S.active = null; $("#app").classList.remove("open"); renderChat(); }
+        renderList(); toast("Chat siz uchun o'chirildi");
+      } else {
+        await sb.from("members").delete().eq("chat_id", c.id).eq("user_id", S.me); dropChat(c.id);
+      }
+    };
+  });
+}
+function dropChat(id){
+  S.chats = S.chats.filter(x => x.id !== id);
+  if (S.active === id) { S.active = null; $("#app").classList.remove("open"); renderChat(); }
+  const pp = $("#ppage"); if (pp) pp.remove();
+  renderList();
 }
 async function react(m, e){
   const r = {...(m.reactions || {})};
@@ -1219,7 +1286,7 @@ function forwardDlg(m){
 /* ---------- context menu & clicks ---------- */
 let pressT = null, pressMoved = false;
 document.addEventListener("contextmenu", e => { const mm = e.target.closest(".m"); if (mm && !e.target.closest("a")) { e.preventDefault(); msgMenu(mm, e.clientX, e.clientY); } });
-document.addEventListener("touchstart", e => { const mm = e.target.closest(".m"); if (!mm) return; pressMoved = false; const t = e.touches[0]; pressT = setTimeout(() => { if (pressMoved) return; try { navigator.vibrate && navigator.vibrate(10); } catch(_){} S.justPressed = Date.now(); msgMenu(mm, t.clientX, t.clientY); }, 450); }, {passive:true});
+document.addEventListener("touchstart", e => { const mm = e.target.closest(".m"); if (!mm) return; pressMoved = false; const t = e.touches[0]; const bub = mm.querySelector(".b"); pressT = setTimeout(() => { if (pressMoved) return; try { navigator.vibrate && navigator.vibrate(10); } catch(_){} S.justPressed = Date.now(); if (bub && bub.animate) bub.animate([{transform:"scale(1)"}, {transform:"scale(.96)"}, {transform:"scale(1)"}], {duration:220}); msgMenu(mm, t.clientX, t.clientY); }, 420); }, {passive:true});
 document.addEventListener("touchmove", () => { pressMoved = true; clearTimeout(pressT); }, {passive:true});
 ["touchend","touchcancel"].forEach(ev => document.addEventListener(ev, () => clearTimeout(pressT), {passive:true}));
 document.addEventListener("click", e => {
@@ -1249,7 +1316,7 @@ function msgMenu(el, x, y){
   if (c && c.type !== "saved" && S.savedId) items.push(["bookmark", "Saqlanganlarga", async () => { try { await insertMsg(S.savedId, {kind:m.kind, text:m.text, media:m.media, fwd_from:m.fwd_from || m.from}); toast("Saqlanganlarga qo'shildi ✅"); } catch(e){ toast("Bo'lmadi"); } }]);
   if (c && c.type !== "saved") items.push(["pin", "Qadab qo'yish", () => pinMsg(m)]);
   if (own && !m.fwd_from && !["sticker","call","round","voice"].includes(m.kind)) items.push(["edit", m.kind && m.kind !== "text" ? "Izohni tahrirlash" : "Tahrirlash", () => { S.editing = m; S.reply = null; renderComposer(); }]);
-  if (own) items.push(["trash", "O'chirish", () => delMsg(m), true]);
+  items.push(["trash", "O'chirish", () => delMsg(m), true]);
   showMenu(items, x, y, c && c.type !== "saved" ? m : null);
 }
 function showMenu(items, x, y, reactFor){
@@ -1677,10 +1744,7 @@ function profilePage(c){
       const r = b.getBoundingClientRect(); const items = [];
       if (dm) { items.push([S.contacts[id] ? "edit" : "userPlus", S.contacts[id] ? "Kontaktni tahrirlash" : "Kontaktga qo'shish", () => editContactDlg(id)]); items.push(["link", "Profilni ulashish", invite]); }
       else items.push(["gear", "Guruhni boshqarish", () => groupManageDlg(c)]);
-      items.push(["trash", dm ? "Tarixni tozalash (mening xabarlarim)" : "Guruhdan chiqish", async () => {
-        if (dm) { if (!await confirmDlg("Tozalash", "Siz yuborgan barcha xabarlar bu chatdan o'chiriladi.", "Tozalash")) return; await sb.from("messages").delete().eq("chat_id", c.id).eq("from_id", S.me); close(); reloadMsgs(); }
-        else { if (!await confirmDlg("Guruhdan chiqish", `«${chatTitle(c)}» guruhidan chiqasizmi?`, "Chiqish")) return; await sb.from("members").delete().eq("chat_id", c.id).eq("user_id", S.me); close(); S.chats = S.chats.filter(x => x.id !== c.id); S.active = null; $("#app").classList.remove("open"); renderChat(); renderList(); }
-      }, true]);
+      items.push(["trash", dm || c.created_by === S.me ? "Chatni o'chirish" : "Guruhdan chiqish", () => deleteChatDlg(c), true]);
       showMenu(items, r.right - 260, r.bottom + 4);
     }
   });
@@ -1755,10 +1819,7 @@ function chatMenu(e, c){
   if (c.type === "dm") { const pr = dmPeer(c); items.push(["userPlus", S.contacts[pr] ? "Kontaktni tahrirlash" : "Kontaktga qo'shish", () => editContactDlg(pr)]); }
   if (c.type === "dm") { items.push(["phone", "Qo'ng'iroq", () => startCall(dmPeer(c), false)]); items.push(["video", "Video qo'ng'iroq", () => startCall(dmPeer(c), true)]); }
   items.push(["search", "Qidirish", toggleSearch]);
-  if (c.type === "dm" || c.type === "saved") items.push(["trash", "Tarixni tozalash (mening xabarlarim)", async () => {
-    if (!await confirmDlg("Tozalash", "Siz yuborgan barcha xabarlar bu chatdan o'chiriladi.", "Tozalash")) return;
-    const { error } = await sb.from("messages").delete().eq("chat_id", c.id).eq("from_id", S.me); if (error) toast("Bo'lmadi"); else reloadMsgs();
-  }, true]);
+  items.push(["trash", c.type === "saved" ? "Tozalash" : c.type === "dm" || c.created_by === S.me ? "Chatni o'chirish" : "Guruhdan chiqish", () => deleteChatDlg(c), true]);
   showMenu(items, r.right - 260, r.bottom + 4);
 }
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeMenu(); closePanel(); } });
